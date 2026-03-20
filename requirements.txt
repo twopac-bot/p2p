@@ -1,0 +1,21 @@
+# P2P File Share - Core Requirements
+#
+# This project uses minimal dependencies to ensure:
+# 1. Android compatibility (pure Python, no native extensions)
+# 2. Easy porting to Kotlin (only standard protocols)
+# 3. Small deployment footprint
+#
+# Core dependencies (required):
+# - Python 3.11+ standard library only for core logic
+#
+# CLI dependencies (for cli/main.py):
+click>=8.0.0
+rich>=13.0.0
+
+# Testing dependencies:
+pytest>=7.0.0
+
+# Future API dependencies (not needed until api/rest_api.py is implemented):
+# fastapi>=0.100.0
+# uvicorn>=0.23.0
+# python-multipart>=0.0.6
