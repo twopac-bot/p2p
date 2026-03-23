@@ -1,223 +1,497 @@
 """
-REST API layer for P2P file sharing system.
+REST API for P2P File Sharing System.
 
-=====================================================================
-SCAFFOLD ONLY - NOT YET IMPLEMENTED
-=====================================================================
+A FastAPI-based REST API that wraps the PeerNode engine for:
+- File uploads to the P2P network
+- File downloads from the P2P network  
+- Download status tracking
+- Download cancellation
 
-This module will provide a FastAPI-based REST API that wraps the
-peer_node.py engine, enabling:
-
-1. Android Integration (via Chaquopy or as a separate server)
-2. Web-based clients
-3. Third-party integrations
-
-IMPLEMENTATION PLAN:
-After the CLI (cli/main.py) is fully working and tested, implement
-this module by wrapping peer_node.upload() and peer_node.download()
-as REST endpoints.
-
-ENDPOINTS TO IMPLEMENT:
------------------------
-
-POST /upload
-    Request Body: multipart/form-data with file
-    Response: { "file_id": "...", "filename": "...", "total_chunks": N }
-    
-    Wraps: peer_node.upload(filepath)
-    
-POST /download
-    Request Body: { "file_id": "..." }
-    Response: Streams file or returns { "status": "started", "progress_url": "/status/{file_id}" }
-    
-    Wraps: peer_node.download(file_id)
-
-GET /status/{file_id}
-    Response: {
-        "file_id": "...",
-        "filename": "...", 
-        "total_chunks": N,
-        "downloaded_chunks": N,
-        "percent": 0.0-100.0,
-        "speed_bps": N,
-        "eta_seconds": N,
-        "is_complete": bool
-    }
-    
-    Wraps: progress_tracker.get_status(file_id)
-
-GET /peers/{file_id}
-    Response: {
-        "file_id": "...",
-        "total_peers": N,
-        "chunks": {
-            "0": [{"host": "...", "port": N}, ...],
-            "1": [...],
-            ...
-        }
-    }
-    
-    Wraps: Tracker client's get_peers()
-
-DELETE /download/{file_id}
-    Cancels an in-progress download and cleans up chunks.
-    Response: { "status": "cancelled" }
-
-WEBSOCKET ENDPOINT (optional future enhancement):
--------------------------------------------------
-
-WS /ws/progress/{file_id}
-    Streams real-time progress updates for Android progress bar.
-    Messages: { "chunk_index": N, "percent": 0.0-100.0, "speed_bps": N }
-
-ANDROID INTEGRATION NOTES:
---------------------------
-
-Option A: Run this FastAPI server on Android via Chaquopy
-    - Start server in a foreground service
-    - Flutter/Kotlin UI calls localhost:8080 endpoints
-    - Pros: Reuse Python code, rapid development
-    - Cons: Python runtime overhead on mobile
-
-Option B: Rewrite API in Kotlin with Ktor
-    - Keep the same REST contract
-    - Reimplement peer_node logic in Kotlin coroutines
-    - Pros: Native performance, smaller APK
-    - Cons: Code duplication, maintenance burden
-
-Recommendation: Start with Option A for MVP, migrate to Option B
-for production if performance is an issue.
-
-AUTHENTICATION (TODO):
----------------------
-
-For public deployments, add:
-- API key authentication via header
-- Rate limiting
-- CORS configuration for web clients
-
-=====================================================================
+Run with:
+    uvicorn api.rest_api:app --host 0.0.0.0 --port 8080 --reload
 """
 
-from typing import Optional
+import asyncio
+import os
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Dict, Optional
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
+
+# Add parent to path for imports
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from utils.config import Config, default_config
+from utils.logger import get_logger, setup_logging
+from peer.peer_node import PeerNode
+from tracker.tracker_server import TrackerClient
+
+# =============================================================================
+# SECTION 1: Imports and Globals
+# =============================================================================
+
+# Initialize logger
+logger = get_logger("api")
+
+# Global PeerNode instance (initialized in lifespan)
+peer_node: Optional[PeerNode] = None
+
+# Track active download tasks: { file_id: asyncio.Task }
+active_tasks: Dict[str, asyncio.Task] = {}
 
 
 # =============================================================================
-# Stub function signatures (to be implemented after CLI is working)
+# SECTION 2: Pydantic Models
 # =============================================================================
 
-async def upload_file(file_path: str) -> dict:
+class DownloadRequest(BaseModel):
+    """Request body for POST /download endpoint."""
+    file_id: str
+    
+    @field_validator('file_id')
+    @classmethod
+    def file_id_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('file_id cannot be empty')
+        return v.strip()
+
+
+class HealthResponse(BaseModel):
+    """Response for GET /health endpoint."""
+    status: str
+    peer_port: int
+    tracker: str
+
+
+class DownloadStartResponse(BaseModel):
+    """Response for POST /download endpoint."""
+    status: str
+    file_id: str
+
+
+class ErrorResponse(BaseModel):
+    """Standard error response."""
+    detail: str
+
+
+# =============================================================================
+# SECTION 3: Lifespan Context Manager
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan context manager for FastAPI app.
+    
+    Handles startup and shutdown of the PeerNode.
+    """
+    global peer_node
+    
+    # Startup
+    logger.info("Starting P2P REST API...")
+    setup_logging()
+    
+    # Create PeerNode with default config (reads from environment variables)
+    peer_node = PeerNode(default_config)
+    logger.info(
+        "PeerNode initialized - Tracker: %s:%d, Peer port: %d",
+        default_config.tracker_host,
+        default_config.tracker_port,
+        default_config.peer_port
+    )
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down P2P REST API...")
+    
+    # Cancel all active download tasks
+    for file_id, task in list(active_tasks.items()):
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        del active_tasks[file_id]
+    
+    # Stop all uploaders
+    if peer_node:
+        await peer_node.stop_all()
+    
+    logger.info("P2P REST API shutdown complete")
+
+
+# =============================================================================
+# SECTION 4: FastAPI App
+# =============================================================================
+
+app = FastAPI(
+    title="P2P File Share API",
+    description="REST API for peer-to-peer file sharing",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Configure CORS - allow all origins for Flutter WebView and local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =============================================================================
+# SECTION 5: Endpoints
+# =============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """
+    Health check endpoint.
+    
+    Returns:
+        Health status with peer port and tracker address.
+        Always returns 200.
+    """
+    return HealthResponse(
+        status="ok",
+        peer_port=default_config.peer_port,
+        tracker=f"{default_config.tracker_host}:{default_config.tracker_port}"
+    )
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)) -> dict:
     """
     Upload a file to the P2P network.
     
+    Accepts a file via multipart/form-data, splits it into chunks,
+    registers with the tracker, and starts serving chunks.
+    
     Args:
-        file_path: Path to the file to upload
+        file: The file to upload (multipart/form-data)
         
     Returns:
-        Dictionary with file_id, filename, total_chunks
+        200: Upload result with file_id, filename, total_chunks, etc.
+        500: Error details if upload failed
     """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
+    global peer_node
+    
+    if peer_node is None:
+        raise HTTPException(status_code=500, detail="PeerNode not initialized")
+    
+    # Generate unique temp filename to avoid conflicts
+    temp_filename = f"tmp_{uuid.uuid4().hex}_{file.filename}"
+    temp_path = Path(default_config.uploads_dir) / temp_filename
+    
+    logger.info("Upload started: %s", file.filename)
+    
+    try:
+        # Ensure uploads directory exists
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save uploaded file to temp location
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info("Saved temp file: %s (%d bytes)", temp_path, len(content))
+        
+        # Call PeerNode.upload()
+        result = await peer_node.upload(
+            filepath=str(temp_path),
+            peer_host=default_config.tracker_host,
+            peer_port=default_config.peer_port
+        )
+        
+        if not result.success:
+            logger.error("Upload failed: %s", result.error)
+            raise HTTPException(status_code=500, detail=result.error or "Upload failed")
+        
+        logger.info(
+            "Upload complete: file_id=%s, chunks=%d",
+            result.file_id[:16] if result.file_id else "None",
+            result.total_chunks
+        )
+        
+        return result.to_dict()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Upload error: %s", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Always clean up temp file
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+                logger.debug("Cleaned up temp file: %s", temp_path)
+            except Exception as e:
+                logger.warning("Failed to clean up temp file %s: %s", temp_path, e)
 
 
-async def start_download(file_id: str) -> dict:
+@app.post("/download", status_code=202, response_model=DownloadStartResponse)
+async def start_download(request: DownloadRequest) -> DownloadStartResponse:
     """
     Start downloading a file from the P2P network.
     
-    Args:
-        file_id: ID of the file to download
-        
-    Returns:
-        Dictionary with download status
-    """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
-
-
-async def get_download_status(file_id: str) -> dict:
-    """
-    Get the status of a download.
+    Initiates an async download task. Use GET /status/{file_id} to track progress.
     
     Args:
-        file_id: ID of the file being downloaded
+        request: JSON body with file_id
         
     Returns:
-        Dictionary with progress information
+        202: Download started with file_id
+        400: Invalid or empty file_id
     """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
+    global peer_node
+    
+    if peer_node is None:
+        raise HTTPException(status_code=500, detail="PeerNode not initialized")
+    
+    file_id = request.file_id
+    
+    logger.info("Download requested: %s", file_id[:16] if len(file_id) > 16 else file_id)
+    
+    # Check if download is already in progress
+    if file_id in active_tasks and not active_tasks[file_id].done():
+        logger.info("Download already in progress: %s", file_id[:16])
+        return DownloadStartResponse(status="already_started", file_id=file_id)
+    
+    # Create async download task (don't await it)
+    async def download_task():
+        try:
+            result = await peer_node.download(file_id)
+            if result.success:
+                logger.info("Download complete: %s -> %s", file_id[:16], result.output_path)
+            else:
+                logger.error("Download failed: %s - %s", file_id[:16], result.error)
+        except Exception as e:
+            logger.exception("Download task error for %s: %s", file_id[:16], e)
+        finally:
+            # Clean up task reference when done
+            if file_id in active_tasks:
+                del active_tasks[file_id]
+    
+    task = asyncio.create_task(download_task())
+    active_tasks[file_id] = task
+    
+    return DownloadStartResponse(status="started", file_id=file_id)
 
 
-async def get_peers_for_file(file_id: str) -> dict:
+@app.get("/status/{file_id}")
+async def get_status(file_id: str) -> dict:
     """
-    Get the peer list for a file.
+    Get download status for a file.
     
     Args:
-        file_id: ID of the file
+        file_id: The file ID to check status for
         
     Returns:
-        Dictionary with peer information per chunk
+        200: Status dictionary with progress information
+        404: File not found or no active download
     """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
+    global peer_node
+    
+    if peer_node is None:
+        raise HTTPException(status_code=500, detail="PeerNode not initialized")
+    
+    if not file_id or not file_id.strip():
+        raise HTTPException(status_code=400, detail="file_id cannot be empty")
+    
+    file_id = file_id.strip()
+    
+    status = await peer_node.get_status(file_id)
+    
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"No status found for file_id: {file_id[:16]}...")
+    
+    return status
 
 
+@app.delete("/download/{file_id}")
 async def cancel_download(file_id: str) -> dict:
     """
     Cancel an in-progress download.
     
-    Args:
-        file_id: ID of the download to cancel
-        
-    Returns:
-        Dictionary with cancellation status
-    """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
-
-
-# =============================================================================
-# FastAPI App Factory (to be implemented)
-# =============================================================================
-
-def create_app(config: Optional[object] = None):
-    """
-    Create the FastAPI application.
+    Cancels the async task and cleans up resources.
     
     Args:
-        config: Optional Config object for dependency injection
+        file_id: The file ID to cancel
         
     Returns:
-        FastAPI application instance
-        
-    Example (after implementation):
-        from api.rest_api import create_app
-        from utils.config import Config
-        
-        config = Config(tracker_host="tracker.example.com")
-        app = create_app(config)
-        
-        # Run with: uvicorn api.rest_api:app --host 0.0.0.0 --port 8080
+        200: { "status": "cancelled", "file_id": "..." }
+        404: No active download found for file_id
     """
-    raise NotImplementedError("REST API not yet implemented - complete CLI first")
+    if not file_id or not file_id.strip():
+        raise HTTPException(status_code=400, detail="file_id cannot be empty")
+    
+    file_id = file_id.strip()
+    
+    logger.info("Cancel requested: %s", file_id[:16] if len(file_id) > 16 else file_id)
+    
+    # Check if there's an active task
+    if file_id not in active_tasks:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active download found for file_id: {file_id[:16]}..."
+        )
+    
+    task = active_tasks[file_id]
+    
+    if task.done():
+        # Task already finished, just clean up reference
+        del active_tasks[file_id]
+        return {"status": "already_completed", "file_id": file_id}
+    
+    # Cancel the task
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    
+    # Clean up reference
+    if file_id in active_tasks:
+        del active_tasks[file_id]
+    
+    logger.info("Download cancelled: %s", file_id[:16])
+    
+    return {"status": "cancelled", "file_id": file_id}
 
 
-# Placeholder for the FastAPI app instance
-# After implementation: app = create_app()
-app = None
+@app.get("/downloads")
+async def list_downloads() -> dict:
+    """
+    List all active and incomplete downloads.
+    
+    Returns:
+        200: {
+            "active": [...],      # Currently running downloads
+            "incomplete": [...]   # Paused/incomplete downloads (can be resumed)
+        }
+    """
+    global peer_node
+    
+    if peer_node is None:
+        raise HTTPException(status_code=500, detail="PeerNode not initialized")
+    
+    # Get active downloads (tasks currently running)
+    active = []
+    for file_id, task in list(active_tasks.items()):
+        if not task.done():
+            # Try to get status for this download
+            status = await peer_node.get_status(file_id)
+            if status:
+                active.append(status)
+            else:
+                active.append({
+                    "file_id": file_id,
+                    "status": "running",
+                    "percent": 0.0
+                })
+    
+    # Get incomplete downloads from progress tracker
+    from peer.progress_tracker import ProgressTracker
+    progress_tracker = ProgressTracker(default_config)
+    incomplete = progress_tracker.list_incomplete_downloads()
+    
+    # Filter out downloads that are currently active
+    active_ids = set(active_tasks.keys())
+    incomplete = [d for d in incomplete if d.get("file_id") not in active_ids]
+    
+    return {
+        "active": active,
+        "incomplete": incomplete,
+        "total_active": len(active),
+        "total_incomplete": len(incomplete)
+    }
+
+
+@app.get("/peers/{file_id}")
+async def get_peers(file_id: str) -> dict:
+    """
+    Get peer list for a file from the tracker.
+    
+    Args:
+        file_id: The file ID to get peers for
+        
+    Returns:
+        200: { "file_id": "...", "peers": [...], "chunk_count": N }
+        404: File not found on tracker
+    """
+    if not file_id or not file_id.strip():
+        raise HTTPException(status_code=400, detail="file_id cannot be empty")
+    
+    file_id = file_id.strip()
+    
+    logger.info("Peers requested: %s", file_id[:16] if len(file_id) > 16 else file_id)
+    
+    try:
+        # Connect to tracker and get peer info
+        tracker_client = TrackerClient(
+            host=default_config.tracker_host,
+            port=default_config.tracker_port
+        )
+        
+        # Get file metadata from tracker
+        file_info = await tracker_client.get_file(file_id)
+        
+        if not file_info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found on tracker: {file_id[:16]}..."
+            )
+        
+        # Get peers for each chunk
+        peers_response = await tracker_client.get_peers(file_id)
+        
+        return {
+            "file_id": file_id,
+            "filename": file_info.get("filename", "unknown"),
+            "total_chunks": file_info.get("total_chunks", 0),
+            "file_size": file_info.get("file_size", 0),
+            "peers": peers_response.get("peers", {}),
+            "peer_count": len(set(
+                f"{p['host']}:{p['port']}"
+                for chunk_peers in peers_response.get("peers", {}).values()
+                for p in chunk_peers
+            ))
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error getting peers for %s: %s", file_id[:16], e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
-# Module info
+# SECTION 6: Entry Point
 # =============================================================================
 
 if __name__ == "__main__":
+    import uvicorn
+    
     print("P2P File Share REST API")
     print("=" * 50)
-    print()
-    print("STATUS: Scaffold only - not yet implemented")
-    print()
-    print("This module will be implemented after the CLI is working.")
-    print("It will wrap peer_node.py as a REST API for Android integration.")
-    print()
-    print("Planned endpoints:")
-    print("  POST   /upload          - Upload a file")
-    print("  POST   /download        - Start a download")
-    print("  GET    /status/{id}     - Get download progress")
-    print("  GET    /peers/{id}      - Get peer list")
-    print("  DELETE /download/{id}   - Cancel download")
+    print(f"Tracker: {default_config.tracker_host}:{default_config.tracker_port}")
+    print(f"Peer Port: {default_config.peer_port}")
+    print(f"Download Dir: {default_config.download_dir}")
+    print("=" * 50)
+    
+    uvicorn.run(
+        "api.rest_api:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=True
+    )
