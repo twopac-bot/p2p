@@ -463,8 +463,9 @@ class TrackerClient:
     async def connect(self) -> None:
         """Connect to the tracker server."""
         host, port = self.config.tracker_host, self.config.tracker_port
+        # 64KB limit is sufficient for tracker metadata messages
         self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
+            asyncio.open_connection(host, port, limit=65536),
             timeout=self.config.connection_timeout
         )
         logger.debug("Connected to tracker at %s:%d", host, port)

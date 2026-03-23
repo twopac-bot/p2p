@@ -43,6 +43,11 @@ DEFAULT_CHUNK_RETRY_ATTEMPTS: int = 3
 DEFAULT_CONNECTION_TIMEOUT: float = 30.0
 DEFAULT_READ_TIMEOUT: float = 60.0
 
+# Buffer sizes for asyncio StreamReader
+# These must accommodate base64-encoded data (33% larger than raw)
+CHUNK_BUFFER_SIZE: int = 2 * 1024 * 1024    # 2MB — handles 1MB chunk + base64 overhead
+METADATA_BUFFER_SIZE: int = 65536           # 64KB — sufficient for tracker messages
+
 # Protocol version for future compatibility
 PROTOCOL_VERSION: str = "1.0"
 

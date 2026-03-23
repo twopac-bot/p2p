@@ -87,10 +87,13 @@ class ChunkUploader:
         """
         bind_port = port if port is not None else self.config.peer_port
         
+        # Limit set to 2MB to handle large chunk requests (though requests are small,
+        # being explicit about buffer size is good practice)
         self._server = await asyncio.start_server(
             self._handle_client,
             host=host,
-            port=bind_port
+            port=bind_port,
+            limit=2 * 1024 * 1024
         )
         
         self._running = True

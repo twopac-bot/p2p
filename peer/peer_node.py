@@ -24,7 +24,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from utils.config import Config, default_config
+from utils.config import Config, default_config, MessageType
 from utils.logger import get_logger
 from utils.hashing import compute_file_id
 from peer.chunk_handler import (

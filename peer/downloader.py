@@ -337,8 +337,9 @@ class ChunkDownloader:
         
         try:
             # Connect to peer
+            # Buffer must handle base64-encoded 1MB chunks (~1.4MB)
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
+                asyncio.open_connection(host, port, limit=2 * 1024 * 1024),
                 timeout=self.config.connection_timeout
             )
             
